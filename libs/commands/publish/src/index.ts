@@ -19,7 +19,7 @@ import {
   prereleaseIdFromVersion,
   ProjectGraphProjectNodeWithPackage,
   promptConfirmation,
-  pulseTillDone,
+  pulseTillDone, RawManifest,
   runProjectsTopologically,
   throwIfUncommitted,
   ValidationError,
@@ -53,6 +53,7 @@ import { interpolate } from "./lib/interpolate";
 import { removeTempLicenses } from "./lib/remove-temp-licenses";
 import { Queue, TailHeadQueue } from "./lib/throttle-queue";
 import { verifyNpmPackageAccess } from "./lib/verify-npm-package-access";
+import yaml from "yaml";
 
 module.exports = function factory(argv: Arguments<PublishCommandConfigOptions>) {
   return new PublishCommand(argv);
@@ -386,6 +387,7 @@ class PublishCommand extends Command {
     }
 
     await this.resolveLocalDependencyLinks();
+    await this.resolveCatalogDependencyLinks();
     await this.resolveWorkspaceDependencyLinks();
     this.annotateGitHead();
     await this.serializeChanges();
@@ -798,6 +800,65 @@ class PublishCommand extends Command {
       });
 
       // writing changes to disk handled in serializeChanges()
+    });
+  }
+
+  private async resolveCatalogDependencyLinks() {
+    const workspaceFile = path.resolve(this.project.rootPath, 'pnpm-workspace.yaml');
+    let workspaceConfig: { catalog: any; catalogs: any };
+
+    try {
+      workspaceConfig = yaml.parse(fs.readFileSync(workspaceFile, 'utf8'));
+    } catch (err) {
+      this.logger.error("Failed to load pnpm-workspace.yaml", err);
+      return;
+    }
+
+    // Merge default catalog and named catalogs
+    const catalogDefinitions = {
+      ...workspaceConfig.catalog,
+      ...Object.entries(workspaceConfig.catalogs || {}).reduce((acc, [catalogName, catalogItems]) => {
+        Object.entries(catalogItems).forEach(([pkgName, version]) => {
+          acc[`${catalogName}:${pkgName}`] = version;
+        });
+        return acc;
+      }, {})
+    };
+
+    const dependencyTypes = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
+    const updatesWithCatalogLinks = this.updates.filter((node) => {
+      const pkg = getPackage(node);
+      return dependencyTypes.some(depType => {
+        const dependencies = pkg.get(depType as keyof RawManifest);
+        return dependencies && Object.keys(dependencies).some(dep => dependencies[dep].startsWith("catalog:"));
+      });
+    });
+
+    await pMap(updatesWithCatalogLinks, (node) => {
+      const pkg = getPackage(node);
+
+      dependencyTypes.forEach(depType => {
+        const dependencies = pkg.get(depType as keyof RawManifest);
+        if (!dependencies) return;
+
+        Object.entries(dependencies).forEach(([depName, depVersion]) => {
+          if (depVersion.startsWith("catalog:")) {
+            // Gets the catalog key: either catalog: or catalog:name
+            const catalogKey = depVersion.slice(8) || depName;
+            const resolvedVersion = catalogDefinitions[catalogKey];
+
+            if (resolvedVersion) {
+              this.logger.verbose("Resolving catalog dependency", `${depName}: ${depVersion} -> ${depName}: ${resolvedVersion}`);
+              dependencies[depName] = resolvedVersion;
+            } else {
+              this.logger.warn("missing catalog entry", `No matching entry for catalog key '${catalogKey}' found in pnpm-workspace.yaml`);
+            }
+          }
+        });
+
+        // Set the updated dependencies back to the package
+        pkg.set(depType as keyof RawManifest, dependencies);
+      });
     });
   }
 
